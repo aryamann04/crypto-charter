@@ -1,3 +1,4 @@
+import os
 import asyncio
 import struct
 import bisect
@@ -14,27 +15,21 @@ MEMLOG = "mem.log"
 init_log(MEMLOG)
 
 PORT = 3000
-MAX_POINTS = 100
-COLLECTION_LIST = ["Asset1", "Asset2"]  
+MAX_POINTS = 10000
 collection_handlers = {}
 
 app = FastAPI()
-
 log_mem_point("FASTAPI Initialized", MEMLOG)
 
-# ---------------- MongoDB Connection ---------------- #
-async def mongoconnect(collection_name: str):
-    client = motor.motor_asyncio.AsyncIOMotorClient('mongodb://gn-algo2:27017/')
-    db = client["Arya"]
-    return db[collection_name]
-# ---------------------------------------------------- #
+_client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("MONGO_URI"))
+_db = _client["db"]
 
-# ---------------- Utility Functions ---------------- #
+async def coll(collection: str):
+    return _db[collection] 
+
 def fast_parse(ts: str) -> int:
-    hh, mm, ss = map(int, (ts[:2], ts[3:5], ts[6:8]))
-    ms = int(ts[9:12])
-    base = (9 * 3600 + 30 * 60) * 1000
-    return (hh * 3600 + mm * 60 + ss) * 1000 + ms - base
+    hh, mm, ss, ms = map(int, (ts[11:13], ts[14:16], ts[17:18], ts[19:22]))
+    return (hh * 3600 + mm * 60 + ss) * 1000 + ms 
 
 def linspace(start, stop, num):
     if num == 1:
@@ -56,9 +51,8 @@ def interp(x, xp, fp):
         return f0 + (f1 - f0) * (xi - x0) / (x1 - x0)
 
     return [interp1(xi) for xi in x] if hasattr(x, '__iter__') else interp1(x)
-# --------------------------------------------------- #
 
-# ------------------ Handler Class ------------------ #
+# ------------------ handler class ------------------ #
 class CollectionHandler:
     def __init__(self, collection_name: str):
         self.collection_name = collection_name
@@ -66,14 +60,14 @@ class CollectionHandler:
         self.clients_lock = asyncio.Lock()
 
         self.DATA_TIMES = array.array('I')
-        self.DATA_VALUES = array.array('f')
-        self.DATA_VALUE2S = array.array('f')
-        self.DATA_VALUE3S = array.array('f')
+        self.DATA_PRICES = array.array('f')
+        self.DATA_QTYS = array.array('f')
+        self.DATA_SIDES = array.array('I')
         self.GLOBAL_MAX = 0
         self.COLLECTION = None
 
     async def setup(self):
-        self.COLLECTION = await mongoconnect(self.collection_name)
+        self.COLLECTION = await coll(self.collection_name)
         asyncio.create_task(self.read_mongo())
 
     async def broadcast_global_max(self):
@@ -96,9 +90,9 @@ class CollectionHandler:
         i1 = bisect.bisect_right(self.DATA_TIMES, end)
 
         xs = self.DATA_TIMES[i0:i1]
-        ys1 = self.DATA_VALUES[i0:i1]
-        ys2 = self.DATA_VALUE2S[i0:i1]
-        ys3 = self.DATA_VALUE3S[i0:i1]
+        ys1 = self.DATA_PRICES[i0:i1]
+        ys2 = self.DATA_QTYS[i0:i1]
+        ys3 = self.DATA_SIDES[i0:i1]
 
         if len(xs) <= MAX_POINTS:
             return list(zip(xs, ys1, ys2, ys3))
@@ -112,27 +106,27 @@ class CollectionHandler:
     def pack_points(self, pts):
         buf = bytearray(len(pts) * 16)
         off = 0
-        for t, v1, v2, v3 in pts:
-            struct.pack_into("<Ifff", buf, off, int(t), v1, v2, v3)
+        for t, p, q, s in pts:
+            struct.pack_into("<Ifff", buf, off, int(t), p, q, int(s))
             off += 16
         return buf
 
     async def read_mongo(self):
-        cursor = self.COLLECTION.find({}, {"timestamp": 1, "value": 1, "value2": 1, "value3": 1}).sort("timestamp", 1)
-        raw = [(doc["timestamp"], doc["value"], doc.get("value2", 0), doc.get("value3", 0)) async for doc in cursor]
+        cursor = self.COLLECTION.find({}, {"price": 1, "quantity": 1, "side": 1, "timestamp": 1}).sort("timestamp", 1)
+        raw = [(doc["timestamp"], doc["price"], doc.get("quantity", 0), doc.get("side", 0)) async for doc in cursor]
 
         if raw:
             t0 = fast_parse(raw[0][0])
             self.DATA_TIMES = array.array('I', (fast_parse(t) - t0 for t, _, _, _ in raw))
-            self.DATA_VALUES = array.array('f', (float(v) for _, v, _, _ in raw))
-            self.DATA_VALUE2S = array.array('f', (float(v2) for _, _, v2, _ in raw))
-            self.DATA_VALUE3S = array.array('f', (float(v3) for _, _, _, v3 in raw))
+            self.DATA_PRICES = array.array('f', (float(v) for _, v, _, _ in raw))
+            self.DATA_QTYS = array.array('f', (float(v2) for _, _, v2, _ in raw))
+            self.SIDES = array.array('I', (float(v3) for _, _, _, v3 in raw))
             self.GLOBAL_MAX = self.DATA_TIMES[-1]
         else:
             self.DATA_TIMES = array.array('I')
-            self.DATA_VALUES = array.array('f')
-            self.DATA_VALUE2S = array.array('f')
-            self.DATA_VALUE3S = array.array('f')
+            self.DATA_PRICES = array.array('f')
+            self.DATA_QTYS = array.array('f')
+            self.DATA_SIDES = array.array('I')
             t0 = 0
 
         last_ping = 0.0
@@ -149,15 +143,15 @@ class CollectionHandler:
             if new_docs:
                 for doc in new_docs:
                     timestamp = doc["timestamp"]
-                    value = float(doc["value"])
-                    value2 = float(doc.get("value2", 0))
-                    value3 = float(doc.get("value3", 0))
+                    p = float(doc["value"])
+                    q = float(doc.get("value2", 0))
+                    s = float(doc.get("value3", 0))
                     new_t = fast_parse(timestamp) - t0
 
                     self.DATA_TIMES.append(int(new_t))
-                    self.DATA_VALUES.append(value)
-                    self.DATA_VALUE2S.append(value2)
-                    self.DATA_VALUE3S.append(value3)
+                    self.DATA_PRICES.append(p)
+                    self.DATA_QTYS.append(q)
+                    self.DATA_SIDES.append(s)
 
                     last_timestamp = timestamp
                     self.GLOBAL_MAX = new_t
@@ -165,7 +159,6 @@ class CollectionHandler:
                 gc.collect()
                 log_mem_point(f"{self.collection_name}: Appended new docs", MEMLOG)
             else:
-                # No new docs this loop
                 pass
 
             del new_docs, new_docs_cursor, query
@@ -175,14 +168,10 @@ class CollectionHandler:
                 last_ping = now_time
                 await self.broadcast_global_max()
 
-            await asyncio.sleep(0.2)
-# ---------------------------------------------------- #
-
-# ---------------- Route Handlers ---------------- #
 @app.get("/{c}")
 async def serve_index(c: str):
     if c not in collection_handlers:
-        return {"error": f"Collection '{c}' not found"}
+        return {"error": f"collection '{c}' not found"}
     return FileResponse("index.html")
 
 @app.websocket("/ws/{c}")
@@ -214,16 +203,17 @@ async def collection_ws(ws: WebSocket, c: str):
     finally:
         async with handler.clients_lock:
             handler.clients.discard(ws)
-# ------------------------------------------------ #
 
-# ---------------- Startup ---------------- #
+# ----------------------------------------- #
 @app.on_event("startup")
 async def startup():
+    COLLECTION_LIST = await _db.list_collection_names()
+    print(COLLECTION_LIST)
+
     for c in COLLECTION_LIST:
         handler = CollectionHandler(collection_name=c)
         await handler.setup()
         collection_handlers[c] = handler
-# ----------------------------------------- #
 
 if __name__ == "__main__":
     import uvicorn

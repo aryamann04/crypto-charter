@@ -28,13 +28,13 @@
         ctx = c.getContext('2d'),
         W = c.width, H = c.height,
         M = {left:50, right:20, top:20, bottom:40},
-        MIN_R = 10000;  // minimal zoom range in ms
+        MIN_R = 10000;  
 
   let viewStart = 0, viewEnd = 0, globalMax = 0,
-      times = [], values = [], values2 = [], values3 = [],
+      times = [], prices = [], qtys = [], sides = [],
       liveMode = true,
       lastFetch = 0,
-      fetchThrottle = 300,
+      fetchThrottle = 50,
       ws;
 
   const COLORS = ['#007bff', '#28a745', '#ff5722'];
@@ -49,8 +49,6 @@
 
   const now = () => performance.now();
 
-  // Clamp view range inside actual data range [dataStart, dataEnd]
-  // Also enforce minimal range MIN_R
   function clampRange(start, end) {
     if (times.length < 2) return [start, end];
 
@@ -59,14 +57,12 @@
 
     let range = end - start;
     if (range < MIN_R) {
-      // Can't zoom in smaller than MIN_R, keep center fixed
       const center = (start + end) / 2;
       range = MIN_R;
       start = center - range / 2;
       end = center + range / 2;
     }
 
-    // Clamp to data boundaries
     if (start < dataStart) {
       start = dataStart;
       end = start + range;
@@ -79,9 +75,8 @@
     return [start, end];
   }
 
-  function formatTime(ms, dec) {
-    const base = (9*3600 + 30*60) * 1000;
-    const d = new Date(base + ms);
+  function formatTime(ms, dec) {;
+    const d = new Date(ms);
     const P = n => String(n).padStart(2, '0');
     const msS = String(Math.floor(d.getUTCMilliseconds() / 10**(3 - dec))).padStart(dec, '0');
     return `${P(d.getUTCHours())}:${P(d.getUTCMinutes())}:${P(d.getUTCSeconds())}.${msS}`;
@@ -117,9 +112,9 @@
     if (i0 < 0 || i1 < i0) return;
 
     const xs = times.slice(i0, i1 + 1);
-    const ys1 = values.slice(i0, i1 + 1);
-    const ys2 = values2.slice(i0, i1 + 1);
-    const ys3 = values3.slice(i0, i1 + 1);
+    const ys1 = prices.slice(i0, i1 + 1);
+    const ys2 = qtys.slice(i0, i1 + 1);
+    const ys3 = sides.slice(i0, i1 + 1);
 
     let y0 = Math.min(...ys1, ...ys2, ...ys3);
     let y1 = Math.max(...ys1, ...ys2, ...ys3);
@@ -130,7 +125,6 @@
           xw = x1 - x0, yh = yb - yt,
           xr = viewEnd - viewStart;
 
-    // Axes
     ctx.strokeStyle = '#666';
     ctx.fillStyle = '#666';
     ctx.lineWidth = 1;
@@ -139,7 +133,6 @@
     ctx.beginPath(); ctx.moveTo(x0, yb); ctx.lineTo(x1, yb); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x0, yb); ctx.lineTo(x0, yt); ctx.stroke();
 
-    // Time ticks
     const tx = Math.min(10, Math.floor(xw / 70));
     const dec = xr / 1e3 > 60 ? 0 : xr / 1e3 > 10 ? 1 : xr / 1e3 > 1 ? 2 : 3;
     for (let i = 0; i <= tx; i++) {
@@ -150,7 +143,6 @@
       ctx.textAlign = 'center'; ctx.fillText(formatTime(t, dec), 0, 0); ctx.restore();
     }
 
-    // Value ticks
     for (let i = 0; i <= 6; i++) {
       const v = y0 + ((y1 - y0) * i) / 6;
       const y = yb - (yh * i) / 6;
@@ -160,12 +152,9 @@
 
     drawLine(xs, ys1, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[0]);
     drawLine(xs, ys2, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[1]);
-    drawLine(xs, ys3, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[2]);
 
-    // Legend
-    ctx.fillStyle = COLORS[0]; ctx.fillText('value', x1 - 150, yt);
-    ctx.fillStyle = COLORS[1]; ctx.fillText('value2', x1 - 90, yt);
-    ctx.fillStyle = COLORS[2]; ctx.fillText('value3', x1 - 30, yt);
+    ctx.fillStyle = COLORS[0]; ctx.fillText('price', x1 - 150, yt);
+    ctx.fillStyle = COLORS[1]; ctx.fillText('qty', x1 - 90, yt);
   }
 
   function manualFetch() {
@@ -218,7 +207,6 @@ function zoom(factor) {
   viewStart = proposedStart;
   viewEnd = proposedEnd;
 
-  // Check if fully zoomed out (exactly full range)
   const fullyZoomedOut = Math.abs(viewStart - dataStart) < 1 && Math.abs(viewEnd - dataEnd) < 1;
   liveMode = fullyZoomedOut;
 
@@ -269,8 +257,8 @@ function zoom(factor) {
 
   let dragging = false, sx = 0, sv = 0;
   c.addEventListener('mousedown', e => {
-    if (e.button !== 0) return; // only left button
-    if (e.offsetX < M.left || e.offsetX > W - M.right) return; // only drag in plot area
+    if (e.button !== 0) return; 
+    if (e.offsetX < M.left || e.offsetX > W - M.right) return; 
     dragging = true;
     sx = e.clientX;
     sv = viewStart;
@@ -322,19 +310,18 @@ function zoom(factor) {
         const n = dv.byteLength / 16;
 
         times = new Array(n);
-        values = new Array(n);
-        values2 = new Array(n);
-        values3 = new Array(n);
+        prices = new Array(n);
+        qtys = new Array(n);
+        sides = new Array(n);
 
         for (let i = 0; i < n; i++) {
           const off = i * 16;
           times[i] = dv.getUint32(off, true);
-          values[i] = dv.getFloat32(off + 4, true);
-          values2[i] = dv.getFloat32(off + 8, true);
-          values3[i] = dv.getFloat32(off + 12, true);
+          prices[i] = dv.getFloat32(off + 4, true);
+          qtys[i] = dv.getFloat32(off + 8, true);
+          sides[i] = dv.getUint32(off + 12, true);
         }
 
-        // On first data, initialize view to full range
         if (viewEnd === 0 && times.length > 1) {
           viewStart = times[0];
           viewEnd = times[times.length - 1];
