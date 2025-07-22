@@ -1,3 +1,4 @@
+import os
 import datetime
 import websockets
 import argparse
@@ -5,17 +6,17 @@ import asyncio
 import motor.motor_asyncio
 import json 
 
-async def connect(collection_name):
-    client = motor.motor_asyncio.AsyncIOMotorClient('mongodb+srv://aryamannagpal04:BdSmL4sH9TVrvmpI@cluster0.2lsafkl.mongodb.net/?retryWrites=true&w=majority')
-    db = client["db"]
-    collection = db[collection_name]
-    return collection 
+_client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("MONGO_URI"))
+_db = _client["db"]
 
-def clear_data(collection): 
+async def coll(collection: str):
+    return _db[collection] 
+
+async def clear_data(collection): 
     collection.delete_many({})
 
 async def add_data(sym):
-    collection = await connect(sym)
+    collection = await coll(sym)
     print(f"[successful connection to {sym}]")
     async with websockets.connect(f"wss://stream.binance.us:9443/ws/{sym}@trade") as ws:
         async for raw in ws:
