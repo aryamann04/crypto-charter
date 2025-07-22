@@ -9,7 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 import motor.motor_asyncio
 
-from memlog import init_log, log_mem_point
+from logmem import init_log, log_mem_point
 
 MEMLOG = "mem.log"
 init_log(MEMLOG)
