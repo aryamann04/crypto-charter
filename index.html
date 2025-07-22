@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Live Chart</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  canvas { display: block; cursor: grab; user-select: none; background: #fff; }
+  #controls { margin: 10px; }
+  #controls button { font-size: 18px; margin-right: 5px; }
+</style>
+</head>
+<body>
+
+<h2 id="chart-title">Live Chart</h2>
+
+<canvas id="chart" width="800" height="300"></canvas>
+<div id="controls">
+  <button onclick="zoomIn()">+</button>
+  <button onclick="zoomOut()">−</button>
+  <button onclick="panLeft()">←</button>
+  <button onclick="panRight()">→</button>
+</div>
+
+<script>
+(() => {
+  const c = document.getElementById('chart'),
+        ctx = c.getContext('2d'),
+        W = c.width, H = c.height,
+        M = {left:50, right:20, top:20, bottom:40},
+        MIN_R = 10000;  // minimal zoom range in ms
+
+  let viewStart = 0, viewEnd = 0, globalMax = 0,
+      times = [], values = [], values2 = [], values3 = [],
+      liveMode = true,
+      lastFetch = 0,
+      fetchThrottle = 300,
+      ws;
+
+  const COLORS = ['#007bff', '#28a745', '#ff5722'];
+
+  const titleElem = document.getElementById('chart-title');
+  const pathSegment = window.location.pathname.split('/')[1];
+  if (pathSegment && pathSegment.length > 0) {
+    titleElem.textContent = pathSegment;
+  } else {
+    titleElem.textContent = 'Live Chart';
+  }
+
+  const now = () => performance.now();
+
+  // Clamp view range inside actual data range [dataStart, dataEnd]
+  // Also enforce minimal range MIN_R
+  function clampRange(start, end) {
+    if (times.length < 2) return [start, end];
+
+    const dataStart = times[0];
+    const dataEnd = times[times.length - 1];
+
+    let range = end - start;
+    if (range < MIN_R) {
+      // Can't zoom in smaller than MIN_R, keep center fixed
+      const center = (start + end) / 2;
+      range = MIN_R;
+      start = center - range / 2;
+      end = center + range / 2;
+    }
+
+    // Clamp to data boundaries
+    if (start < dataStart) {
+      start = dataStart;
+      end = start + range;
+    }
+    if (end > dataEnd) {
+      end = dataEnd;
+      start = end - range;
+    }
+
+    return [start, end];
+  }
+
+  function formatTime(ms, dec) {
+    const base = (9*3600 + 30*60) * 1000;
+    const d = new Date(base + ms);
+    const P = n => String(n).padStart(2, '0');
+    const msS = String(Math.floor(d.getUTCMilliseconds() / 10**(3 - dec))).padStart(dec, '0');
+    return `${P(d.getUTCHours())}:${P(d.getUTCMinutes())}:${P(d.getUTCSeconds())}.${msS}`;
+  }
+
+  function drawLine(xs, ys, x0, xw, viewStart, xr, yb, yh, y0, y1, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < xs.length; i++) {
+      const x = x0 + ((xs[i] - viewStart) / xr) * xw;
+      const y = yb - ((ys[i] - y0) / (y1 - y0)) * yh;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    if (times.length < 2) return;
+
+    let i0 = times.findIndex(t => t >= viewStart);
+    let i1 = times.length - 1;
+    for (let i = times.length - 1; i >= 0; i--) {
+      if (times[i] <= viewEnd) {
+        i1 = i;
+        break;
+      }
+    }
+
+    if (i0 < 0 || i1 < i0) return;
+
+    const xs = times.slice(i0, i1 + 1);
+    const ys1 = values.slice(i0, i1 + 1);
+    const ys2 = values2.slice(i0, i1 + 1);
+    const ys3 = values3.slice(i0, i1 + 1);
+
+    let y0 = Math.min(...ys1, ...ys2, ...ys3);
+    let y1 = Math.max(...ys1, ...ys2, ...ys3);
+    if (y0 === y1) y1++;
+
+    const x0 = M.left, x1 = W - M.right,
+          yb = H - M.bottom, yt = M.top,
+          xw = x1 - x0, yh = yb - yt,
+          xr = viewEnd - viewStart;
+
+    // Axes
+    ctx.strokeStyle = '#666';
+    ctx.fillStyle = '#666';
+    ctx.lineWidth = 1;
+    ctx.font = '12px sans-serif';
+
+    ctx.beginPath(); ctx.moveTo(x0, yb); ctx.lineTo(x1, yb); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x0, yb); ctx.lineTo(x0, yt); ctx.stroke();
+
+    // Time ticks
+    const tx = Math.min(10, Math.floor(xw / 70));
+    const dec = xr / 1e3 > 60 ? 0 : xr / 1e3 > 10 ? 1 : xr / 1e3 > 1 ? 2 : 3;
+    for (let i = 0; i <= tx; i++) {
+      const t = viewStart + (xr * i) / tx;
+      const x = x0 + (xw * i) / tx;
+      ctx.beginPath(); ctx.moveTo(x, yb); ctx.lineTo(x, yb + 6); ctx.stroke();
+      ctx.save(); ctx.translate(x, yb + 18); ctx.rotate(-Math.PI / 6);
+      ctx.textAlign = 'center'; ctx.fillText(formatTime(t, dec), 0, 0); ctx.restore();
+    }
+
+    // Value ticks
+    for (let i = 0; i <= 6; i++) {
+      const v = y0 + ((y1 - y0) * i) / 6;
+      const y = yb - (yh * i) / 6;
+      ctx.beginPath(); ctx.moveTo(x0 - 6, y); ctx.lineTo(x0, y); ctx.stroke();
+      ctx.textAlign = 'right'; ctx.fillText(v.toFixed(2), x0 - 8, y);
+    }
+
+    drawLine(xs, ys1, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[0]);
+    drawLine(xs, ys2, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[1]);
+    drawLine(xs, ys3, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[2]);
+
+    // Legend
+    ctx.fillStyle = COLORS[0]; ctx.fillText('value', x1 - 150, yt);
+    ctx.fillStyle = COLORS[1]; ctx.fillText('value2', x1 - 90, yt);
+    ctx.fillStyle = COLORS[2]; ctx.fillText('value3', x1 - 30, yt);
+  }
+
+  function manualFetch() {
+    const t = now();
+    if (t - lastFetch < fetchThrottle) {
+      return;
+    }
+    lastFetch = t;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        action: "manual_fetch",
+        t_start: Math.floor(viewStart),
+        t_end: Math.ceil(viewEnd)
+      }));
+    }
+  }
+function zoom(factor) {
+  if (times.length < 2) return;
+
+  const dataStart = times[0];
+  const dataEnd = times[times.length - 1];
+
+  const mid = (viewStart + viewEnd) / 2;
+  let half = ((viewEnd - viewStart) * factor) / 2;
+
+  // Clamp minimum zoom range (zoom in limit)
+  if (half * 2 < MIN_R) {
+    half = MIN_R / 2;
+  }
+
+  let proposedStart = mid - half;
+  let proposedEnd = mid + half;
+
+  // Clamp proposedStart/proposedEnd inside data range
+  if (proposedStart < dataStart) {
+    proposedStart = dataStart;
+    proposedEnd = proposedStart + 2 * half;
+    if (proposedEnd > dataEnd) {
+      proposedEnd = dataEnd;
+    }
+  }
+  if (proposedEnd > dataEnd) {
+    proposedEnd = dataEnd;
+    proposedStart = proposedEnd - 2 * half;
+    if (proposedStart < dataStart) {
+      proposedStart = dataStart;
+    }
+  }
+
+  viewStart = proposedStart;
+  viewEnd = proposedEnd;
+
+  // Check if fully zoomed out (exactly full range)
+  const fullyZoomedOut = Math.abs(viewStart - dataStart) < 1 && Math.abs(viewEnd - dataEnd) < 1;
+  liveMode = fullyZoomedOut;
+
+  draw();
+  manualFetch();
+}
+
+
+  window.zoomIn = () => zoom(0.8);
+  window.zoomOut = () => zoom(1.1);
+
+  window.panLeft = () => {
+    const r = viewEnd - viewStart;
+    let newStart = viewStart - r * 0.2;
+    let newEnd = viewEnd - r * 0.2;
+
+    [viewStart, viewEnd] = clampRange(newStart, newEnd);
+    liveMode = false;
+    draw();
+    manualFetch();
+  };
+
+  window.panRight = () => {
+    const r = viewEnd - viewStart;
+    let newStart = viewStart + r * 0.2;
+    let newEnd = viewEnd + r * 0.2;
+
+    [viewStart, viewEnd] = clampRange(newStart, newEnd);
+    liveMode = false;
+    draw();
+    manualFetch();
+  };
+
+  c.addEventListener('wheel', e => {
+    e.preventDefault();
+    if (e.ctrlKey) {
+      if (e.deltaY < 0) window.zoomIn();
+      else window.zoomOut();
+    }
+    else if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+      if (e.deltaX > 0) {
+        window.panRight();
+      } else {
+        window.panLeft();
+      }
+    }
+  });
+
+  let dragging = false, sx = 0, sv = 0;
+  c.addEventListener('mousedown', e => {
+    if (e.button !== 0) return; // only left button
+    if (e.offsetX < M.left || e.offsetX > W - M.right) return; // only drag in plot area
+    dragging = true;
+    sx = e.clientX;
+    sv = viewStart;
+    c.style.cursor = 'grabbing';
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - sx;
+    const r = viewEnd - viewStart;
+    const shift = (dx / (W - M.left - M.right)) * r;
+    let newStart = sv - shift;
+    let newEnd = newStart + r;
+    [viewStart, viewEnd] = clampRange(newStart, newEnd);
+    liveMode = false;
+    draw();
+  });
+  window.addEventListener('mouseup', () => {
+    if (dragging) {
+      dragging = false;
+      c.style.cursor = 'grab';
+      manualFetch();
+    }
+  });
+
+  function connect() {
+    const collection = window.location.pathname.split("/")[1];
+    const wsUrl = `ws://${location.host}/ws/${collection}`;
+    ws = new WebSocket(wsUrl);
+
+    ws.binaryType = 'arraybuffer';
+
+    ws.onclose = () => {
+      setTimeout(connect, 1000);
+    };
+
+    ws.onmessage = ev => {
+      if (typeof ev.data === 'string') {
+        const m = JSON.parse(ev.data);
+        if (m.action === 'global_max') {
+          globalMax = m.globalMax;
+          if (liveMode) {
+            viewEnd = globalMax;
+            viewStart = 0;
+            manualFetch();
+          }
+        }
+      } else {
+        const dv = new DataView(ev.data);
+        const n = dv.byteLength / 16;
+
+        times = new Array(n);
+        values = new Array(n);
+        values2 = new Array(n);
+        values3 = new Array(n);
+
+        for (let i = 0; i < n; i++) {
+          const off = i * 16;
+          times[i] = dv.getUint32(off, true);
+          values[i] = dv.getFloat32(off + 4, true);
+          values2[i] = dv.getFloat32(off + 8, true);
+          values3[i] = dv.getFloat32(off + 12, true);
+        }
+
+        // On first data, initialize view to full range
+        if (viewEnd === 0 && times.length > 1) {
+          viewStart = times[0];
+          viewEnd = times[times.length - 1];
+          liveMode = true;
+        }
+
+        draw();
+      }
+    };
+  }
+
+  connect();
+
+  ctx.fillStyle = '#ccc';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#000';
+  ctx.fillText('loading data...', W/2 - 50, H/2);
+
+})();
+</script>
+</body>
+</html>
