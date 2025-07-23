@@ -5,31 +5,73 @@ import bisect
 import time
 import gc
 import array
+import motor.motor_asyncio
+import argparse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-import motor.motor_asyncio
+from contextlib import asynccontextmanager 
 
+from dotenv import load_dotenv
+from data import add_data
 from logmem import init_log, log_mem_point
 
+# ----------------------------------------- #
 MEMLOG = "mem.log"
-init_log(MEMLOG)
-
 PORT = 3000
 MAX_POINTS = 10000
 collection_handlers = {}
 
-app = FastAPI()
-log_mem_point("FASTAPI Initialized", MEMLOG)
+init_log(MEMLOG)
 
+# ----------------------------------------- #
+load_dotenv()
 _client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("MONGO_URI"))
 _db = _client["db"]
 
+assets = None
+STREAM_TASKS = []
+
+def parse_assets():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-a", "--assets", nargs="+",
+                    default=["btcusd", "ethusd", "solusd", "dogeusd"])
+    return [s.lower() for s in ap.parse_args().assets]
+
+assets = parse_assets()
+
+async def start_data(assets):
+    for sym in assets:
+        STREAM_TASKS.append(asyncio.create_task(add_data(sym)))
+    return assets
+
+async def init_handlers():
+    await asyncio.gather(*(register_handler(n) for n in assets))
+
+async def register_handler(c):
+    h = CollectionHandler(c)
+    await h.setup()
+    collection_handlers[c] = h
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.assets = assets
+    await start_data(assets) 
+
+    for sym in assets:
+        asyncio.create_task(register_handler(sym))
+
+    yield
+
+    for t in STREAM_TASKS:
+        t.cancel()
+    
+    await asyncio.gather(*STREAM_TASKS, return_exceptions=True)
+
+app = FastAPI(lifespan=lifespan)
+
+# ----------------------------------------- #
 async def coll(collection: str):
     return _db[collection] 
-
-def fast_parse(ts: str) -> int:
-    hh, mm, ss, ms = map(int, (ts[11:13], ts[14:16], ts[17:18], ts[19:22]))
-    return (hh * 3600 + mm * 60 + ss) * 1000 + ms 
 
 def linspace(start, stop, num):
     if num == 1:
@@ -59,7 +101,7 @@ class CollectionHandler:
         self.clients: set[WebSocket] = set()
         self.clients_lock = asyncio.Lock()
 
-        self.DATA_TIMES = array.array('I')
+        self.DATA_TIMES = array.array('Q')
         self.DATA_PRICES = array.array('f')
         self.DATA_QTYS = array.array('f')
         self.DATA_SIDES = array.array('I')
@@ -104,11 +146,11 @@ class CollectionHandler:
         return list(zip(xs2, ys1i, ys2i, ys3i))
 
     def pack_points(self, pts):
-        buf = bytearray(len(pts) * 16)
+        buf = bytearray(len(pts) * 20)
         off = 0
         for t, p, q, s in pts:
-            struct.pack_into("<Ifff", buf, off, int(t), p, q, int(s))
-            off += 16
+            struct.pack_into("<QffI", buf, off, int(t), p, q, int(s))
+            off += 20
         return buf
 
     async def read_mongo(self):
@@ -116,14 +158,14 @@ class CollectionHandler:
         raw = [(doc["timestamp"], doc["price"], doc.get("quantity", 0), doc.get("side", 0)) async for doc in cursor]
 
         if raw:
-            t0 = fast_parse(raw[0][0])
-            self.DATA_TIMES = array.array('I', (fast_parse(t) - t0 for t, _, _, _ in raw))
-            self.DATA_PRICES = array.array('f', (float(v) for _, v, _, _ in raw))
-            self.DATA_QTYS = array.array('f', (float(v2) for _, _, v2, _ in raw))
-            self.SIDES = array.array('I', (float(v3) for _, _, _, v3 in raw))
+            t0 = int((raw[0][0]))
+            self.DATA_TIMES = array.array('Q', (int(t) for t, _, _, _ in raw))
+            self.DATA_PRICES = array.array('f', (float(p) for _, p, _, _ in raw))
+            self.DATA_QTYS = array.array('f', (float(q) for _, _, q, _ in raw))
+            self.DATA_SIDES = array.array('I', (int(s) for _, _, _, s in raw))
             self.GLOBAL_MAX = self.DATA_TIMES[-1]
         else:
-            self.DATA_TIMES = array.array('I')
+            self.DATA_TIMES = array.array('Q')
             self.DATA_PRICES = array.array('f')
             self.DATA_QTYS = array.array('f')
             self.DATA_SIDES = array.array('I')
@@ -137,24 +179,20 @@ class CollectionHandler:
 
         while True:
             query = {"timestamp": {"$gt": last_timestamp}} if last_timestamp else {}
-            new_docs_cursor = self.COLLECTION.find(query, {"timestamp": 1, "value": 1, "value2": 1, "value3": 1}).sort("timestamp", 1)
+            new_docs_cursor = self.COLLECTION.find(query, {"price": 1, "quantity": 1, "side": 1, "timestamp": 1}).sort("timestamp", 1)
             new_docs = [doc async for doc in new_docs_cursor]
 
             if new_docs:
                 for doc in new_docs:
                     timestamp = doc["timestamp"]
-                    p = float(doc["value"])
-                    q = float(doc.get("value2", 0))
-                    s = float(doc.get("value3", 0))
-                    new_t = fast_parse(timestamp) - t0
 
-                    self.DATA_TIMES.append(int(new_t))
-                    self.DATA_PRICES.append(p)
-                    self.DATA_QTYS.append(q)
-                    self.DATA_SIDES.append(s)
+                    self.DATA_TIMES.append(int(timestamp))
+                    self.DATA_PRICES.append(float(doc["price"]))
+                    self.DATA_QTYS.append(float(doc.get("quantity", 0)))
+                    self.DATA_SIDES.append(int(doc.get("side", 0)))
 
                     last_timestamp = timestamp
-                    self.GLOBAL_MAX = new_t
+                    self.GLOBAL_MAX = timestamp
 
                 gc.collect()
                 log_mem_point(f"{self.collection_name}: Appended new docs", MEMLOG)
@@ -168,6 +206,7 @@ class CollectionHandler:
                 last_ping = now_time
                 await self.broadcast_global_max()
 
+# ----------------------------------------- #
 @app.get("/{c}")
 async def serve_index(c: str):
     if c not in collection_handlers:
@@ -205,16 +244,6 @@ async def collection_ws(ws: WebSocket, c: str):
             handler.clients.discard(ws)
 
 # ----------------------------------------- #
-@app.on_event("startup")
-async def startup():
-    COLLECTION_LIST = await _db.list_collection_names()
-    print(COLLECTION_LIST)
-
-    for c in COLLECTION_LIST:
-        handler = CollectionHandler(collection_name=c)
-        await handler.setup()
-        collection_handlers[c] = handler
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)

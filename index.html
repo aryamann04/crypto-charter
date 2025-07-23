@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>Live Chart</title>
+<title>Crypto Chart</title>
 <style>
   body { margin: 0; font-family: sans-serif; }
   canvas { display: block; cursor: grab; user-select: none; background: #fff; }
@@ -12,9 +12,9 @@
 </head>
 <body>
 
-<h2 id="chart-title">Live Chart</h2>
+<h2 id="chart-title">Crypto Chart</h2>
 
-<canvas id="chart" width="800" height="300"></canvas>
+<canvas id="chart" width="900" height="400"></canvas>
 <div id="controls">
   <button onclick="zoomIn()">+</button>
   <button onclick="zoomOut()">−</button>
@@ -27,8 +27,8 @@
   const c = document.getElementById('chart'),
         ctx = c.getContext('2d'),
         W = c.width, H = c.height,
-        M = {left:50, right:20, top:20, bottom:40},
-        MIN_R = 10000;  
+        M = {left:60, right:60, top:20, bottom:50},
+        MIN_R = 10_000;  // ms
 
   let viewStart = 0, viewEnd = 0, globalMax = 0,
       times = [], prices = [], qtys = [], sides = [],
@@ -37,193 +37,176 @@
       fetchThrottle = 50,
       ws;
 
-  const COLORS = ['#007bff', '#28a745', '#ff5722'];
+  const COLORS = {
+    price: '#007bff',
+    qty:   '#28a745'
+  };
 
   const titleElem = document.getElementById('chart-title');
-  const pathSegment = window.location.pathname.split('/')[1];
-  if (pathSegment && pathSegment.length > 0) {
-    titleElem.textContent = pathSegment;
-  } else {
-    titleElem.textContent = 'Live Chart';
-  }
+  const collection = window.location.pathname.split('/')[1] || 'Live Chart';
+  titleElem.textContent = collection;
 
-  const now = () => performance.now();
+  const nowPerf = () => performance.now();
 
   function clampRange(start, end) {
     if (times.length < 2) return [start, end];
 
     const dataStart = times[0];
-    const dataEnd = times[times.length - 1];
+    const dataEnd   = times[times.length - 1];
 
     let range = end - start;
     if (range < MIN_R) {
       const center = (start + end) / 2;
       range = MIN_R;
       start = center - range / 2;
-      end = center + range / 2;
+      end   = center + range / 2;
     }
-
-    if (start < dataStart) {
-      start = dataStart;
-      end = start + range;
-    }
-    if (end > dataEnd) {
-      end = dataEnd;
-      start = end - range;
-    }
-
+    if (start < dataStart) { start = dataStart; end = start + range; }
+    if (end   > dataEnd)   { end   = dataEnd;   start = end - range; }
     return [start, end];
   }
 
-  function formatTime(ms, dec) {;
-    const d = new Date(ms);
-    const P = n => String(n).padStart(2, '0');
-    const msS = String(Math.floor(d.getUTCMilliseconds() / 10**(3 - dec))).padStart(dec, '0');
-    return `${P(d.getUTCHours())}:${P(d.getUTCMinutes())}:${P(d.getUTCSeconds())}.${msS}`;
+  // EST formatter
+  function formatTimeEST(ms) {
+    return new Date(Number(ms)).toLocaleString(
+      'en-US',
+      { timeZone: 'America/New_York', hour12: false,
+        month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' }
+    );
   }
 
-  function drawLine(xs, ys, x0, xw, viewStart, xr, yb, yh, y0, y1, color) {
+  function drawLine(xs, ys, x0, xw, vStart, xr, yBottom, yH, y0, y1, color) {
     ctx.strokeStyle = color;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     for (let i = 0; i < xs.length; i++) {
-      const x = x0 + ((xs[i] - viewStart) / xr) * xw;
-      const y = yb - ((ys[i] - y0) / (y1 - y0)) * yh;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      const x = x0 + ((xs[i] - vStart) / xr) * xw;
+      const y = yBottom - ((ys[i] - y0) / (y1 - y0)) * yH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
   }
 
   function draw() {
     ctx.clearRect(0, 0, W, H);
-
     if (times.length < 2) return;
 
+    // Visible slice
     let i0 = times.findIndex(t => t >= viewStart);
+    if (i0 < 0) i0 = 0;
     let i1 = times.length - 1;
     for (let i = times.length - 1; i >= 0; i--) {
-      if (times[i] <= viewEnd) {
-        i1 = i;
-        break;
-      }
+      if (times[i] <= viewEnd) { i1 = i; break; }
     }
+    if (i1 < i0) return;
 
-    if (i0 < 0 || i1 < i0) return;
+    const xs  = times.slice(i0, i1 + 1);
+    const pYs = prices.slice(i0, i1 + 1);
+    const qYs = qtys.slice(i0, i1 + 1);
 
-    const xs = times.slice(i0, i1 + 1);
-    const ys1 = prices.slice(i0, i1 + 1);
-    const ys2 = qtys.slice(i0, i1 + 1);
-    const ys3 = sides.slice(i0, i1 + 1);
+    // Price axis (left)
+    let pMin = Math.min(...pYs), pMax = Math.max(...pYs);
+    if (pMin === pMax) pMax += 1;
 
-    let y0 = Math.min(...ys1, ...ys2, ...ys3);
-    let y1 = Math.max(...ys1, ...ys2, ...ys3);
-    if (y0 === y1) y1++;
+    // Qty axis (right)
+    let qMin = Math.min(...qYs), qMax = Math.max(...qYs);
+    if (qMin === qMax) qMax += 1;
 
+    // Geometry
     const x0 = M.left, x1 = W - M.right,
-          yb = H - M.bottom, yt = M.top,
-          xw = x1 - x0, yh = yb - yt,
+          yBottom = H - M.bottom, yTop = M.top,
+          xW = x1 - x0, yH = yBottom - yTop,
           xr = viewEnd - viewStart;
 
-    ctx.strokeStyle = '#666';
-    ctx.fillStyle = '#666';
-    ctx.lineWidth = 1;
-    ctx.font = '12px sans-serif';
+    // Axes
+    ctx.strokeStyle = '#666'; ctx.fillStyle = '#666'; ctx.lineWidth = 1; ctx.font = '11px sans-serif';
 
-    ctx.beginPath(); ctx.moveTo(x0, yb); ctx.lineTo(x1, yb); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(x0, yb); ctx.lineTo(x0, yt); ctx.stroke();
+    // X-axis
+    ctx.beginPath(); ctx.moveTo(x0, yBottom); ctx.lineTo(x1, yBottom); ctx.stroke();
+    // Y-axis left
+    ctx.beginPath(); ctx.moveTo(x0, yBottom); ctx.lineTo(x0, yTop); ctx.stroke();
+    // Y-axis right
+    ctx.beginPath(); ctx.moveTo(x1, yBottom); ctx.lineTo(x1, yTop); ctx.stroke();
 
-    const tx = Math.min(10, Math.floor(xw / 70));
-    const dec = xr / 1e3 > 60 ? 0 : xr / 1e3 > 10 ? 1 : xr / 1e3 > 1 ? 2 : 3;
+    // X ticks
+    const tx = Math.min(10, Math.floor(xW / 90));
     for (let i = 0; i <= tx; i++) {
       const t = viewStart + (xr * i) / tx;
-      const x = x0 + (xw * i) / tx;
-      ctx.beginPath(); ctx.moveTo(x, yb); ctx.lineTo(x, yb + 6); ctx.stroke();
-      ctx.save(); ctx.translate(x, yb + 18); ctx.rotate(-Math.PI / 6);
-      ctx.textAlign = 'center'; ctx.fillText(formatTime(t, dec), 0, 0); ctx.restore();
+      const x = x0 + (xW * i) / tx;
+      ctx.beginPath(); ctx.moveTo(x, yBottom); ctx.lineTo(x, yBottom + 6); ctx.stroke();
+      ctx.save();
+      ctx.translate(x, yBottom + 18);
+      ctx.rotate(-Math.PI / 6);
+      ctx.textAlign = 'center';
+      ctx.fillText(formatTimeEST(t), 0, 0);
+      ctx.restore();
     }
 
+    // Y ticks left (price)
+    ctx.textAlign = 'right';
     for (let i = 0; i <= 6; i++) {
-      const v = y0 + ((y1 - y0) * i) / 6;
-      const y = yb - (yh * i) / 6;
+      const v = pMin + ((pMax - pMin) * i) / 6;
+      const y = yBottom - (yH * i) / 6;
       ctx.beginPath(); ctx.moveTo(x0 - 6, y); ctx.lineTo(x0, y); ctx.stroke();
-      ctx.textAlign = 'right'; ctx.fillText(v.toFixed(2), x0 - 8, y);
+      ctx.fillText(v.toFixed(2), x0 - 8, y + 3);
     }
 
-    drawLine(xs, ys1, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[0]);
-    drawLine(xs, ys2, x0, xw, viewStart, xr, yb, yh, y0, y1, COLORS[1]);
+    // Y ticks right (qty)
+    ctx.textAlign = 'left';
+    for (let i = 0; i <= 6; i++) {
+      const v = qMin + ((qMax - qMin) * i) / 6;
+      const y = yBottom - (yH * i) / 6;
+      ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x1 + 6, y); ctx.stroke();
+      ctx.fillText(v.toFixed(4), x1 + 8, y + 3);
+    }
 
-    ctx.fillStyle = COLORS[0]; ctx.fillText('price', x1 - 150, yt);
-    ctx.fillStyle = COLORS[1]; ctx.fillText('qty', x1 - 90, yt);
+    // Lines
+    drawLine(xs, pYs, x0, xW, viewStart, xr, yBottom, yH, pMin, pMax, COLORS.price);
+    drawLine(xs, qYs, x0, xW, viewStart, xr, yBottom, yH, qMin, qMax, COLORS.qty);
+
+    // Legends
+    ctx.fillStyle = COLORS.price; ctx.fillText('price', x0 + 10, yTop + 12);
+    ctx.fillStyle = COLORS.qty;   ctx.fillText('qty',   x1 - 40, yTop + 12);
   }
 
+  // Fetch windowed data
   function manualFetch() {
-    const t = now();
-    if (t - lastFetch < fetchThrottle) {
-      return;
-    }
+    const t = nowPerf();
+    if (t - lastFetch < fetchThrottle) return;
     lastFetch = t;
+
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         action: "manual_fetch",
         t_start: Math.floor(viewStart),
-        t_end: Math.ceil(viewEnd)
+        t_end:   Math.ceil(viewEnd)
       }));
     }
   }
-function zoom(factor) {
-  if (times.length < 2) return;
 
-  const dataStart = times[0];
-  const dataEnd = times[times.length - 1];
+  function zoom(factor) {
+    if (times.length < 2) return;
+    const dataStart = times[0], dataEnd = times[times.length - 1];
+    const mid = (viewStart + viewEnd) / 2;
+    let half = ((viewEnd - viewStart) * factor) / 2;
+    if (half * 2 < MIN_R) half = MIN_R / 2;
 
-  const mid = (viewStart + viewEnd) / 2;
-  let half = ((viewEnd - viewStart) * factor) / 2;
+    let s = mid - half, e = mid + half;
+    [viewStart, viewEnd] = clampRange(s, e);
+    liveMode = Math.abs(viewStart - dataStart) < 1 && Math.abs(viewEnd - dataEnd) < 1;
 
-  // Clamp minimum zoom range (zoom in limit)
-  if (half * 2 < MIN_R) {
-    half = MIN_R / 2;
+    draw();
+    manualFetch();
   }
 
-  let proposedStart = mid - half;
-  let proposedEnd = mid + half;
-
-  // Clamp proposedStart/proposedEnd inside data range
-  if (proposedStart < dataStart) {
-    proposedStart = dataStart;
-    proposedEnd = proposedStart + 2 * half;
-    if (proposedEnd > dataEnd) {
-      proposedEnd = dataEnd;
-    }
-  }
-  if (proposedEnd > dataEnd) {
-    proposedEnd = dataEnd;
-    proposedStart = proposedEnd - 2 * half;
-    if (proposedStart < dataStart) {
-      proposedStart = dataStart;
-    }
-  }
-
-  viewStart = proposedStart;
-  viewEnd = proposedEnd;
-
-  const fullyZoomedOut = Math.abs(viewStart - dataStart) < 1 && Math.abs(viewEnd - dataEnd) < 1;
-  liveMode = fullyZoomedOut;
-
-  draw();
-  manualFetch();
-}
-
-
-  window.zoomIn = () => zoom(0.8);
+  window.zoomIn  = () => zoom(0.8);
   window.zoomOut = () => zoom(1.1);
 
   window.panLeft = () => {
     const r = viewEnd - viewStart;
-    let newStart = viewStart - r * 0.2;
-    let newEnd = viewEnd - r * 0.2;
-
-    [viewStart, viewEnd] = clampRange(newStart, newEnd);
+    let ns = viewStart - r * 0.2;
+    let ne = viewEnd   - r * 0.2;
+    [viewStart, viewEnd] = clampRange(ns, ne);
     liveMode = false;
     draw();
     manualFetch();
@@ -231,34 +214,19 @@ function zoom(factor) {
 
   window.panRight = () => {
     const r = viewEnd - viewStart;
-    let newStart = viewStart + r * 0.2;
-    let newEnd = viewEnd + r * 0.2;
-
-    [viewStart, viewEnd] = clampRange(newStart, newEnd);
+    let ns = viewStart + r * 0.2;
+    let ne = viewEnd   + r * 0.2;
+    [viewStart, viewEnd] = clampRange(ns, ne);
     liveMode = false;
     draw();
     manualFetch();
   };
 
-  c.addEventListener('wheel', e => {
-    e.preventDefault();
-    if (e.ctrlKey) {
-      if (e.deltaY < 0) window.zoomIn();
-      else window.zoomOut();
-    }
-    else if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-      if (e.deltaX > 0) {
-        window.panRight();
-      } else {
-        window.panLeft();
-      }
-    }
-  });
-
+  // mouse interactivity
   let dragging = false, sx = 0, sv = 0;
   c.addEventListener('mousedown', e => {
-    if (e.button !== 0) return; 
-    if (e.offsetX < M.left || e.offsetX > W - M.right) return; 
+    if (e.button !== 0) return;
+    if (e.offsetX < M.left || e.offsetX > W - M.right) return;
     dragging = true;
     sx = e.clientX;
     sv = viewStart;
@@ -269,9 +237,9 @@ function zoom(factor) {
     const dx = e.clientX - sx;
     const r = viewEnd - viewStart;
     const shift = (dx / (W - M.left - M.right)) * r;
-    let newStart = sv - shift;
-    let newEnd = newStart + r;
-    [viewStart, viewEnd] = clampRange(newStart, newEnd);
+    let ns = sv - shift;
+    let ne = ns + r;
+    [viewStart, viewEnd] = clampRange(ns, ne);
     liveMode = false;
     draw();
   });
@@ -283,16 +251,13 @@ function zoom(factor) {
     }
   });
 
+  // websocket
   function connect() {
-    const collection = window.location.pathname.split("/")[1];
     const wsUrl = `ws://${location.host}/ws/${collection}`;
     ws = new WebSocket(wsUrl);
-
     ws.binaryType = 'arraybuffer';
 
-    ws.onclose = () => {
-      setTimeout(connect, 1000);
-    };
+    ws.onclose = () => setTimeout(connect, 1000);
 
     ws.onmessage = ev => {
       if (typeof ev.data === 'string') {
@@ -301,31 +266,32 @@ function zoom(factor) {
           globalMax = m.globalMax;
           if (liveMode) {
             viewEnd = globalMax;
-            viewStart = 0;
+            viewStart = times.length ? times[0] : globalMax - 60_000;
             manualFetch();
           }
         }
       } else {
         const dv = new DataView(ev.data);
-        const n = dv.byteLength / 16;
+        const BYTES = 20;  // <QffI
+        const n = dv.byteLength / BYTES;
 
-        times = new Array(n);
+        times  = new Array(n);
         prices = new Array(n);
-        qtys = new Array(n);
-        sides = new Array(n);
+        qtys   = new Array(n);
+        sides  = new Array(n);
 
         for (let i = 0; i < n; i++) {
-          const off = i * 16;
-          times[i] = dv.getUint32(off, true);
-          prices[i] = dv.getFloat32(off + 4, true);
-          qtys[i] = dv.getFloat32(off + 8, true);
-          sides[i] = dv.getUint32(off + 12, true);
+          const off = i * BYTES;
+          times[i]  = Number(dv.getBigUint64(off, true)); // ms absolute
+          prices[i] = dv.getFloat32(off + 8,  true);
+          qtys[i]   = dv.getFloat32(off + 12, true);
+          sides[i]  = dv.getUint32 (off + 16, true);
         }
 
         if (viewEnd === 0 && times.length > 1) {
           viewStart = times[0];
-          viewEnd = times[times.length - 1];
-          liveMode = true;
+          viewEnd   = times[times.length - 1];
+          liveMode  = true;
         }
 
         draw();
